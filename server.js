@@ -378,7 +378,7 @@ async function requireAuth(req, res, next) {
       return res.status(401).json({ error: 'Not authenticated' });
     }
     // Suspension must take effect immediately, not only at the next login -
-    // a 12h token issued before suspension would otherwise keep working.
+    // a 2h token issued before suspension would otherwise keep working.
     const [[row]] = await pool.query('SELECT status FROM users WHERE id = ?', [payload.uid]);
     if (!row) return res.status(401).json({ error: 'Not authenticated' });
     if (row.status === 'suspended') {
@@ -409,6 +409,19 @@ async function logAdmin(req, action, targetType, targetId, details) {
     await pool.execute(
       'INSERT INTO admin_audit_log (admin_id, action, target_type, target_id, details, ip) VALUES (?,?,?,?,?,?)',
       [req.adminId, action, targetType, String(targetId ?? ''), details ? JSON.stringify(details) : null, (req.ip || '').toString().slice(0, 64)]
+    );
+  } catch (err) {
+    console.error('Audit log write failed:', err.message);
+  }
+}
+
+// Admin sign-in attempts (successful and failed) go in the same log, so you
+// can see if someone is guessing admin passwords or PINs.
+async function logAdminEvent(req, action, adminId, who) {
+  try {
+    await pool.execute(
+      'INSERT INTO admin_audit_log (admin_id, action, target_type, target_id, details, ip) VALUES (?,?,?,?,?,?)',
+      [adminId ?? null, action, 'admin_login', cleanText(who, 60), null, (req.ip || '').toString().slice(0, 64)]
     );
   } catch (err) {
     console.error('Audit log write failed:', err.message);
@@ -562,6 +575,27 @@ const FACEPP_COMPARE_URL = 'https://api-us.faceplusplus.com/facepp/v3/compare';
 
 // image1Base64 / image2Base64 should be raw base64 (no "data:image/..." prefix).
 // Returns { confidence, matched } on success, or throws on a Face++/network error.
+// Free Face++ keys only allow about one request at a time. Registration makes
+// several Face++ calls in a row (duplicate search, ID comparison, adding the
+// face), so any of them can come back "CONCURRENCY_LIMIT_EXCEEDED". Instead of
+// failing (which sent accounts to manual review with no score), wait a moment
+// and try again, up to 4 times.
+async function faceppFetch(url, form) {
+  let last = null;
+  for (const waitMs of [0, 1200, 2400, 3600]) {
+    if (waitMs) await new Promise((resolve) => setTimeout(resolve, waitMs));
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: form,
+    });
+    const data = await res.json();
+    last = { res, data };
+    if (!/CONCURRENCY_LIMIT_EXCEEDED/i.test(data.error_message || '')) break;
+  }
+  return last;
+}
+
 async function compareFaces(image1Base64, image2Base64) {
   if (!FACEPP_API_KEY || !FACEPP_API_SECRET) {
     throw new Error('Face verification is not configured on the server');
@@ -573,12 +607,7 @@ async function compareFaces(image1Base64, image2Base64) {
   form.set('image_base64_1', image1Base64);
   form.set('image_base64_2', image2Base64);
 
-  const res = await fetch(FACEPP_COMPARE_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: form,
-  });
-  const data = await res.json();
+  const { res, data } = await faceppFetch(FACEPP_COMPARE_URL, form);
 
   if (!res.ok || data.error_message) {
     throw new Error(data.error_message || 'Face comparison failed');
@@ -613,12 +642,7 @@ async function faceppPost(path, fields) {
   form.set('api_key', FACEPP_API_KEY);
   form.set('api_secret', FACEPP_API_SECRET);
   for (const [k, v] of Object.entries(fields)) form.set(k, v);
-  const res = await fetch(`${FACEPP_BASE}${path}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: form,
-  });
-  const data = await res.json();
+  const { res, data } = await faceppFetch(`${FACEPP_BASE}${path}`, form);
   if (!res.ok || data.error_message) throw new Error(data.error_message || `Face++ ${path} failed`);
   return data;
 }
@@ -813,6 +837,15 @@ app.post('/api/register', registerIpLimiter, authLimiter, asyncRoute(async (req,
       verificationStatus = 'pending';
     }
 
+    // Only a sign-up confirmed with a real fingerprint touch may be approved
+    // automatically. Phones with just a screen lock, no lock, or a browser go
+    // to an admin even if the face matched. (This is what the app reports; a
+    // modified app could claim 'fingerprint', so it is a safeguard, not proof.)
+    const verificationMethod = typeof req.body?.verificationMethod === 'string' ? req.body.verificationMethod : 'none';
+    if (verificationMethod !== 'fingerprint' && verificationStatus === 'approved') {
+      verificationStatus = 'pending';
+    }
+
     const passwordHash = await bcrypt.hash(password, 10);
     const pinHash = await bcrypt.hash(pin, 10);
     const walletId = phoneNumber;
@@ -947,13 +980,100 @@ app.post('/api/login/verify-pin', pinLimiter, asyncRoute(async (req, res) => {
   }
   await clearAttempts(identifier);
 
-  const token = sign({ uid: user.id, stage: 'full', role: 'user' }, '12h');
+  const token = sign({ uid: user.id, stage: 'full', role: 'user' }, '2h');
   res.json({
     token,
     // balance is returned as an integer count of centavos — the client
     // divides by 100 only when displaying it.
     user: { id: user.id, username: user.username, walletId: user.wallet_id, balance: toCentavos(user.balance) },
   });
+}));
+
+// ---------- fingerprint / device login ----------
+// After a normal login the person can switch on "fingerprint login" in the
+// app. The server then gives that phone a random device token (only its
+// SHA-256 hash is stored here). The phone keeps the token in its secure
+// keystore and only reveals it after a fingerprint check. Logging in with it
+// gives a normal 2-hour session without typing password + PIN. The token is
+// replaced with a fresh one on every use, expires after 30 days of not being
+// used, and can be revoked. Money actions still ask for the PIN.
+const DEVICE_TOKEN_DAYS = 30;
+const MAX_DEVICES_PER_USER = 5;
+const sha256 = (text) => crypto.createHash('sha256').update(text).digest('hex');
+
+const deviceLoginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => ipKeyGenerator(req),
+  message: { error: 'Too many attempts. Please try again later.' },
+});
+
+app.post('/api/device/enroll', requireAuth, moneyLimiter, requirePin, asyncRoute(async (req, res) => {
+  const deviceName = cleanText(req.body?.deviceName, 100) || 'Phone';
+
+  // Keep at most MAX_DEVICES_PER_USER phones: drop the oldest ones.
+  const [existing] = await pool.execute('SELECT id FROM device_tokens WHERE user_id = ? ORDER BY created_at DESC', [req.userId]);
+  if (existing.length >= MAX_DEVICES_PER_USER) {
+    const dropIds = existing.slice(MAX_DEVICES_PER_USER - 1).map((r) => r.id);
+    await pool.query('DELETE FROM device_tokens WHERE id IN (?)', [dropIds]);
+  }
+
+  const deviceToken = crypto.randomBytes(32).toString('hex');
+  await pool.execute(
+    'INSERT INTO device_tokens (user_id, token_hash, device_name, expires_at) VALUES (?, ?, ?, DATE_ADD(NOW(), INTERVAL ? DAY))',
+    [req.userId, sha256(deviceToken), deviceName, DEVICE_TOKEN_DAYS]
+  );
+  res.json({ deviceToken });
+}));
+
+app.post('/api/login/device', deviceLoginLimiter, asyncRoute(async (req, res) => {
+  const expired = { error: 'Fingerprint login expired. Please log in with your password.' };
+  const deviceToken = req.body?.deviceToken;
+  if (typeof deviceToken !== 'string' || !/^[0-9a-f]{64}$/.test(deviceToken)) {
+    return res.status(401).json(expired);
+  }
+  const oldHash = sha256(deviceToken);
+  const [[row]] = await pool.query(
+    `SELECT d.id AS device_id, u.id, u.username, u.wallet_id, u.balance, u.status, u.verification_status
+       FROM device_tokens d JOIN users u ON u.id = d.user_id
+      WHERE d.token_hash = ? AND d.expires_at > NOW()`,
+    [oldHash]
+  );
+  if (!row) return res.status(401).json(expired);
+  if (row.status === 'suspended') {
+    return res.status(403).json({ error: 'This account has been suspended. Contact support for assistance.' });
+  }
+  if (row.verification_status !== 'approved') {
+    return res.status(403).json({ error: 'Your account is not verified. Please log in with your password.' });
+  }
+
+  // Swap in a new token. The WHERE on the old hash means an old token that was
+  // already used (replayed, or raced) matches nothing and is refused.
+  const newToken = crypto.randomBytes(32).toString('hex');
+  const [swap] = await pool.execute(
+    'UPDATE device_tokens SET token_hash = ?, last_used_at = NOW(), expires_at = DATE_ADD(NOW(), INTERVAL ? DAY) WHERE id = ? AND token_hash = ?',
+    [sha256(newToken), DEVICE_TOKEN_DAYS, row.device_id, oldHash]
+  );
+  if (swap.affectedRows !== 1) return res.status(401).json(expired);
+
+  res.json({
+    token: sign({ uid: row.id, stage: 'full', role: 'user' }, '2h'),
+    deviceToken: newToken,
+    user: { id: row.id, username: row.username, walletId: row.wallet_id, balance: toCentavos(row.balance) },
+  });
+}));
+
+// Turn fingerprint login off for this phone (or all phones if no token is sent).
+app.post('/api/device/revoke', requireAuth, asyncRoute(async (req, res) => {
+  const deviceToken = req.body?.deviceToken;
+  if (typeof deviceToken === 'string' && /^[0-9a-f]{64}$/.test(deviceToken)) {
+    await pool.execute('DELETE FROM device_tokens WHERE user_id = ? AND token_hash = ?', [req.userId, sha256(deviceToken)]);
+  } else {
+    await pool.execute('DELETE FROM device_tokens WHERE user_id = ?', [req.userId]);
+  }
+  res.json({ ok: true });
 }));
 
 app.get('/api/me', requireAuth, asyncRoute(async (req, res) => {
@@ -1811,6 +1931,7 @@ app.post('/api/admin/login', adminLimiter, asyncRoute(async (req, res) => {
   const identifier = `admin:${username.toString().trim().toLowerCase()}`;
   const lockedForSeconds = await checkLockout(identifier);
   if (lockedForSeconds !== null) {
+    await logAdminEvent(req, 'admin_login_locked', null, username);
     return res.status(429).json({ error: `Too many failed attempts. Try again in ${lockedForSeconds} second(s).` });
   }
 
@@ -1819,6 +1940,7 @@ app.post('/api/admin/login', adminLimiter, asyncRoute(async (req, res) => {
   const ok = await bcrypt.compare(password || '', admin ? admin.password_hash : DUMMY_BCRYPT_HASH);
   if (!admin || !ok) {
     await recordFailedAttempt(identifier);
+    await logAdminEvent(req, 'admin_login_failed', admin ? admin.id : null, username);
     return res.status(401).json({ error: 'Incorrect admin credentials' });
   }
   if (!admin.pin_hash) {
@@ -1843,6 +1965,7 @@ app.post('/api/admin/login/verify-pin', adminPinLimiter, asyncRoute(async (req, 
   const identifier = `adminpin:${payload.uid}`;
   const lockedForSeconds = await checkLockout(identifier);
   if (lockedForSeconds !== null) {
+    await logAdminEvent(req, 'admin_pin_locked', payload.uid, `admin ${payload.uid}`);
     return res.status(429).json({ error: `Too many failed attempts. Try again in ${lockedForSeconds} second(s).` });
   }
 
@@ -1851,9 +1974,11 @@ app.post('/api/admin/login/verify-pin', adminPinLimiter, asyncRoute(async (req, 
   const ok = await bcrypt.compare(pin || '', admin ? admin.pin_hash : DUMMY_BCRYPT_HASH);
   if (!admin || !ok) {
     await recordFailedAttempt(identifier);
+    await logAdminEvent(req, 'admin_pin_failed', payload.uid, `admin ${payload.uid}`);
     return res.status(401).json({ error: 'Incorrect PIN' });
   }
   await clearAttempts(identifier);
+  await logAdminEvent(req, 'admin_login', admin.id, `admin ${admin.id}`);
 
   const token = sign({ uid: admin.id, stage: 'full', role: 'admin' }, '4h');
   res.json({ token });
@@ -2664,44 +2789,51 @@ app.use((err, req, res, next) => {
 // serve both the REST API and the WebSocket upgrade at /ws — no second
 // port/process to deploy or configure.
 const server = http.createServer(app);
-const wss = new WebSocketServer({ server, path: '/ws' });
+const wss = new WebSocketServer({ server, path: '/ws', maxPayload: 4096 });
 
-wss.on('connection', (ws, req) => {
-  // The client can't attach an Authorization header to a WebSocket
-  // handshake on every platform (Flutter web in particular), so the same
-  // session token used for REST calls is passed as a query param instead:
-  // wss://host/ws?token=<jwt>. It's verified with the exact same
-  // requireAuth rules — full stage, user role — as any REST route.
-  let userId;
-  try {
-    const { searchParams } = new URL(req.url, 'http://localhost');
-    const payload = verify(searchParams.get('token'));
-    if (!payload || payload.stage !== 'full' || payload.role !== 'user') {
-      ws.close(4001, 'Not authenticated');
-      return;
-    }
-    userId = payload.uid;
-  } catch {
-    ws.close(4001, 'Not authenticated');
-    return;
-  }
-
-  registerSocket(userId, ws);
+// The session token is NOT taken from the URL (web addresses end up in proxy
+// and server logs). The client connects, then must send
+//   {"type":"auth","token":"<jwt>"}
+// as its first message within 5 seconds, or it is disconnected. The token is
+// checked with the same rules as requireAuth: full stage, user role.
+wss.on('connection', (ws) => {
   ws.isAlive = true;
   ws.on('pong', () => {
     ws.isAlive = true;
   });
-  ws.on('close', () => unregisterSocket(userId, ws));
-  ws.on('error', () => unregisterSocket(userId, ws));
+  const authTimer = setTimeout(() => ws.close(4001, 'Not authenticated'), 5000);
+  ws.on('close', () => clearTimeout(authTimer));
+  ws.on('error', () => clearTimeout(authTimer));
 
-  // Send the current balance immediately on connect, so the client has a
-  // correct number even if it connects between polls/actions.
-  pool
-    .query('SELECT balance FROM users WHERE id = ?', [userId])
-    .then(([[row]]) => {
-      if (row) pushToUser(userId, { type: 'balance', balanceCentavos: toCentavos(row.balance) });
-    })
-    .catch(() => {});
+  ws.once('message', (data) => {
+    clearTimeout(authTimer);
+    let userId;
+    try {
+      const msg = JSON.parse(data.toString());
+      const payload = msg && msg.type === 'auth' ? verify(msg.token) : null;
+      if (!payload || payload.stage !== 'full' || payload.role !== 'user') {
+        ws.close(4001, 'Not authenticated');
+        return;
+      }
+      userId = payload.uid;
+    } catch {
+      ws.close(4001, 'Not authenticated');
+      return;
+    }
+
+    registerSocket(userId, ws);
+    ws.on('close', () => unregisterSocket(userId, ws));
+    ws.on('error', () => unregisterSocket(userId, ws));
+
+    // Send the current balance immediately, so the client has a correct
+    // number even if it connects between polls/actions.
+    pool
+      .query('SELECT balance FROM users WHERE id = ?', [userId])
+      .then(([[row]]) => {
+        if (row) pushToUser(userId, { type: 'balance', balanceCentavos: toCentavos(row.balance) });
+      })
+      .catch(() => {});
+  });
 });
 
 // Phones and flaky networks often drop a WebSocket without a clean close
