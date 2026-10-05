@@ -845,6 +845,12 @@ app.post('/api/register', registerIpLimiter, authLimiter, asyncRoute(async (req,
     if (verificationMethod !== 'fingerprint' && verificationStatus === 'approved') {
       verificationStatus = 'pending';
     }
+    // The app sets this when the ID number had to be typed in, or the live
+    // selfie check was skipped after repeated misses. An admin reviews those
+    // photos by hand, whatever the face score says.
+    if (req.body?.needsManualReview === true && verificationStatus === 'approved') {
+      verificationStatus = 'pending';
+    }
 
     const passwordHash = await bcrypt.hash(password, 10);
     const pinHash = await bcrypt.hash(pin, 10);
