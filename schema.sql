@@ -129,12 +129,10 @@ CREATE TABLE IF NOT EXISTS transactions (
   amount BIGINT NOT NULL,
   is_credit TINYINT(1) NOT NULL,
   transfer_ref VARCHAR(64) NULL,
-  reversed_transfer_ref VARCHAR(64) NULL,
   details JSON NULL,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   KEY idx_tx_account (account_type, account_id, created_at),
-  KEY idx_tx_ref (transfer_ref),
-  KEY idx_tx_reversed (reversed_transfer_ref)
+  KEY idx_tx_ref (transfer_ref)
 ) ENGINE=InnoDB;
 
 CREATE TABLE IF NOT EXISTS savings_goals (
@@ -214,6 +212,18 @@ CREATE TABLE IF NOT EXISTS login_attempts (
   identifier VARCHAR(100) NOT NULL,
   attempted_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   KEY idx_attempts (identifier, attempted_at)
+) ENGINE=InnoDB;
+
+-- ---------- phone verification codes (sign-up SMS) ----------
+CREATE TABLE IF NOT EXISTS phone_otps (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  phone_number VARCHAR(20) NOT NULL,
+  code_hash CHAR(64) NOT NULL,
+  attempts INT NOT NULL DEFAULT 0,
+  expires_at DATETIME NOT NULL,
+  consumed TINYINT(1) NOT NULL DEFAULT 0,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  KEY idx_phone_otps (phone_number, created_at)
 ) ENGINE=InnoDB;
 
 -- No admin is created here on purpose. After loading this schema run:

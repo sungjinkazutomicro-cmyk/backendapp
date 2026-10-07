@@ -78,6 +78,7 @@ const crypto = require('crypto');
 const http = require('http');
 const { WebSocketServer } = require('ws');
 const pool = require('./db');
+const { sendSms, smsIsReal } = require('./sms');
 const { PROVIDERS, findCheapestRoute } = require('./graph');
 process.on('unhandledRejection', (reason) => {
   console.error('Unhandled rejection (server stayed up):', reason);
@@ -691,6 +692,146 @@ const availabilityLimiter = rateLimit({
   message: { error: 'Too many attempts. Please try again later.' },
 });
 
+// ---------- phone number verification (SMS code) ----------
+// Sign-up flow: the app asks for a code (send-otp), the person types the 6 digits
+// they received (verify-otp), and the server hands back a short-lived signed token
+// that /api/register requires. Codes are stored hashed, expire after 5 minutes,
+// allow 5 wrong guesses, and can only be re-sent once a minute.
+const OTP_TTL_SECONDS = 5 * 60;
+const OTP_RESEND_SECONDS = 60;
+const OTP_MAX_ATTEMPTS = 5;
+const OTP_MAX_SENDS_PER_HOUR = 5;
+// Turn off only for local testing of old app builds: REQUIRE_PHONE_OTP=false
+const REQUIRE_PHONE_OTP = process.env.REQUIRE_PHONE_OTP !== 'false';
+// Dev mode: with no SMS provider set, the code is returned to the app so the demo works.
+// Never leave this on once real SMS is configured (it is ignored then anyway).
+const OTP_DEV_MODE = !smsIsReal && process.env.OTP_DEV_MODE === 'true';
+
+pool.execute(
+  `CREATE TABLE IF NOT EXISTS phone_otps (
+     id INT AUTO_INCREMENT PRIMARY KEY,
+     phone_number VARCHAR(20) NOT NULL,
+     code_hash CHAR(64) NOT NULL,
+     attempts INT NOT NULL DEFAULT 0,
+     expires_at DATETIME NOT NULL,
+     consumed TINYINT(1) NOT NULL DEFAULT 0,
+     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+     KEY idx_phone_otps (phone_number, created_at)
+   ) ENGINE=InnoDB`
+).catch((err) => console.error('Could not create phone_otps table:', err.message));
+
+function hashOtp(phone, code) {
+  return crypto.createHmac('sha256', JWT_SECRET).update(`${phone}:${code}`).digest('hex');
+}
+
+const otpSendLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => ipKeyGenerator(req),
+  message: { error: 'Too many code requests from this network. Please try again later.' },
+});
+
+const otpVerifyLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => ipKeyGenerator(req),
+  message: { error: 'Too many attempts. Please try again later.' },
+});
+
+app.post('/api/phone/send-otp', otpSendLimiter, asyncRoute(async (req, res) => {
+  const phoneNumber = req.body?.phoneNumber;
+  if (typeof phoneNumber !== 'string' || !/^09\d{9}$/.test(phoneNumber)) {
+    return res.status(400).json({ error: 'Phone number must be 11 digits starting with 09 (e.g. 09171234567)' });
+  }
+  const [taken] = await pool.execute('SELECT id FROM users WHERE phone_number = ? OR wallet_id = ?', [phoneNumber, phoneNumber]);
+  if (taken.length > 0) {
+    return res.status(409).json({ error: 'That phone number is already registered to an account' });
+  }
+
+  // Cooldown between sends + hourly cap per number.
+  const [recent] = await pool.execute(
+    `SELECT TIMESTAMPDIFF(SECOND, created_at, NOW()) AS age FROM phone_otps
+      WHERE phone_number = ? ORDER BY id DESC LIMIT 1`,
+    [phoneNumber]
+  );
+  if (recent.length > 0 && recent[0].age < OTP_RESEND_SECONDS) {
+    const wait = OTP_RESEND_SECONDS - recent[0].age;
+    return res.status(429).json({ error: `Please wait ${wait}s before asking for a new code`, retryAfterSeconds: wait });
+  }
+  const [hourly] = await pool.execute(
+    'SELECT COUNT(*) AS n FROM phone_otps WHERE phone_number = ? AND created_at > (NOW() - INTERVAL 1 HOUR)',
+    [phoneNumber]
+  );
+  if (hourly[0].n >= OTP_MAX_SENDS_PER_HOUR) {
+    return res.status(429).json({ error: 'Too many codes sent to this number. Please try again in an hour.' });
+  }
+
+  const code = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
+  // Older codes for this number stop working as soon as a new one is issued.
+  await pool.execute('UPDATE phone_otps SET consumed = 1 WHERE phone_number = ? AND consumed = 0', [phoneNumber]);
+  await pool.execute(
+    `INSERT INTO phone_otps (phone_number, code_hash, expires_at)
+     VALUES (?, ?, NOW() + INTERVAL ${OTP_TTL_SECONDS} SECOND)`,
+    [phoneNumber, hashOtp(phoneNumber, code)]
+  );
+
+  try {
+    await sendSms(phoneNumber, `Your PayCST verification code is ${code}. It expires in 5 minutes. Do not share it with anyone.`);
+  } catch (err) {
+    console.error('SMS send failed:', err.message);
+    await pool.execute('UPDATE phone_otps SET consumed = 1 WHERE phone_number = ? AND consumed = 0', [phoneNumber]);
+    return res.status(502).json({ error: 'We could not send the text message. Please try again in a moment.' });
+  }
+
+  const body = { ok: true, expiresInSeconds: OTP_TTL_SECONDS, resendAfterSeconds: OTP_RESEND_SECONDS };
+  if (OTP_DEV_MODE) body.devCode = code;
+  res.json(body);
+}));
+
+app.post('/api/phone/verify-otp', otpVerifyLimiter, asyncRoute(async (req, res) => {
+  const { phoneNumber, code } = req.body || {};
+  if (typeof phoneNumber !== 'string' || !/^09\d{9}$/.test(phoneNumber) || typeof code !== 'string' || !/^\d{6}$/.test(code)) {
+    return res.status(400).json({ error: 'Enter the 6-digit code we sent you' });
+  }
+  const [rows] = await pool.execute(
+    `SELECT id, code_hash, attempts, (expires_at < NOW()) AS expired FROM phone_otps
+      WHERE phone_number = ? AND consumed = 0 ORDER BY id DESC LIMIT 1`,
+    [phoneNumber]
+  );
+  if (rows.length === 0) {
+    return res.status(400).json({ error: 'No active code for this number. Please request a new one.' });
+  }
+  const row = rows[0];
+  if (row.expired) {
+    await pool.execute('UPDATE phone_otps SET consumed = 1 WHERE id = ?', [row.id]);
+    return res.status(400).json({ error: 'That code has expired. Please request a new one.' });
+  }
+  if (row.attempts >= OTP_MAX_ATTEMPTS) {
+    await pool.execute('UPDATE phone_otps SET consumed = 1 WHERE id = ?', [row.id]);
+    return res.status(429).json({ error: 'Too many wrong tries. Please request a new code.' });
+  }
+
+  const given = Buffer.from(hashOtp(phoneNumber, code), 'hex');
+  const real = Buffer.from(row.code_hash, 'hex');
+  if (given.length !== real.length || !crypto.timingSafeEqual(given, real)) {
+    await pool.execute('UPDATE phone_otps SET attempts = attempts + 1 WHERE id = ?', [row.id]);
+    const left = OTP_MAX_ATTEMPTS - (row.attempts + 1);
+    return res.status(400).json({
+      error: left > 0 ? `Wrong code. ${left} ${left === 1 ? 'try' : 'tries'} left.` : 'Too many wrong tries. Please request a new code.',
+    });
+  }
+
+  await pool.execute('UPDATE phone_otps SET consumed = 1 WHERE id = ?', [row.id]);
+  // Proof of ownership that /api/register checks. Valid for 15 minutes (long enough
+  // to finish the ID + selfie steps) and only for this exact phone number.
+  const verificationToken = sign({ purpose: 'phone-verify', phone: phoneNumber }, '15m');
+  res.json({ ok: true, verificationToken });
+}));
+
 // ---------- registration / login (password, THEN pin) ----------
 
 app.get('/api/register/check', availabilityLimiter, asyncRoute(async (req, res) => {
@@ -740,6 +881,7 @@ app.post('/api/register', registerIpLimiter, authLimiter, asyncRoute(async (req,
     username, password, pin, phoneNumber,
     termsAccepted, governmentIdNumber,
     governmentIdPhotoFrontBase64, governmentIdPhotoBackBase64, selfiePhotoBase64,
+    phoneVerificationToken,
   } = req.body || {};
 
   if (!username || !password || !pin || !phoneNumber) {
@@ -764,6 +906,12 @@ app.post('/api/register', registerIpLimiter, authLimiter, asyncRoute(async (req,
   }
   if (!termsAccepted) {
     return res.status(400).json({ error: 'You must accept the Terms and Conditions to register' });
+  }
+  if (REQUIRE_PHONE_OTP) {
+    const proof = typeof phoneVerificationToken === 'string' ? verify(phoneVerificationToken) : null;
+    if (!proof || proof.purpose !== 'phone-verify' || proof.phone !== phoneNumber) {
+      return res.status(400).json({ error: 'Please verify your phone number with the code we text you' });
+    }
   }
   if (!governmentIdNumber || !governmentIdNumber.toString().trim()) {
     return res.status(400).json({ error: 'A government-issued ID number is required' });
@@ -2377,8 +2525,7 @@ app.post('/api/undo', requireAuth, moneyLimiter, asyncRoute(async (req, res) => 
 //    application time and stored on the row (loans.approvals_needed), so
 //    it can't drift if the tier thresholds change later.
 
-// TEMPORARILY 0 for the paper demo (no waiting period). Set back to 3 to restore the rule.
-const MIN_ACCOUNT_AGE_DAYS = 0;
+const MIN_ACCOUNT_AGE_DAYS = 3;
 const MIN_AGE = 18;
 const MAX_FIRST_LOAN_AMOUNT_CENTAVOS = 1_000_000; // ₱10,000.00
 const LOAN_TIER_1_CENTAVOS = 500_000; // ₱5,000.00
@@ -2413,7 +2560,7 @@ app.post('/api/loans', requireAuth, asyncRoute(async (req, res) => {
   const [[user]] = await pool.query('SELECT created_at FROM users WHERE id = ?', [req.userId]);
 
   const accountAgeDays = (Date.now() - new Date(user.created_at).getTime()) / (1000 * 60 * 60 * 24);
-  if (MIN_ACCOUNT_AGE_DAYS > 0 && accountAgeDays < MIN_ACCOUNT_AGE_DAYS) {
+  if (accountAgeDays < MIN_ACCOUNT_AGE_DAYS) {
     return res.status(400).json({
       error: `Your account needs to be at least ${MIN_ACCOUNT_AGE_DAYS} day(s) old before you're eligible for a loan`,
     });
