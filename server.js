@@ -2377,7 +2377,8 @@ app.post('/api/undo', requireAuth, moneyLimiter, asyncRoute(async (req, res) => 
 //    application time and stored on the row (loans.approvals_needed), so
 //    it can't drift if the tier thresholds change later.
 
-const MIN_ACCOUNT_AGE_DAYS = 3;
+// TEMPORARILY 0 for the paper demo (no waiting period). Set back to 3 to restore the rule.
+const MIN_ACCOUNT_AGE_DAYS = 0;
 const MIN_AGE = 18;
 const MAX_FIRST_LOAN_AMOUNT_CENTAVOS = 1_000_000; // ₱10,000.00
 const LOAN_TIER_1_CENTAVOS = 500_000; // ₱5,000.00
@@ -2412,7 +2413,7 @@ app.post('/api/loans', requireAuth, asyncRoute(async (req, res) => {
   const [[user]] = await pool.query('SELECT created_at FROM users WHERE id = ?', [req.userId]);
 
   const accountAgeDays = (Date.now() - new Date(user.created_at).getTime()) / (1000 * 60 * 60 * 24);
-  if (accountAgeDays < MIN_ACCOUNT_AGE_DAYS) {
+  if (MIN_ACCOUNT_AGE_DAYS > 0 && accountAgeDays < MIN_ACCOUNT_AGE_DAYS) {
     return res.status(400).json({
       error: `Your account needs to be at least ${MIN_ACCOUNT_AGE_DAYS} day(s) old before you're eligible for a loan`,
     });

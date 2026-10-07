@@ -24,6 +24,27 @@ async function setupDatabase() {
   });
   try {
     await conn.query(sql);
+
+    // CREATE TABLE IF NOT EXISTS never changes a table that already exists, so
+    // columns added later have to be added here for databases made earlier.
+    const missingColumns = [
+      {
+        table: 'transactions',
+        column: 'reversed_transfer_ref',
+        add: 'ADD COLUMN reversed_transfer_ref VARCHAR(64) NULL, ADD KEY idx_tx_reversed (reversed_transfer_ref)',
+      },
+    ];
+    for (const { table, column, add } of missingColumns) {
+      const [found] = await conn.query(
+        'SELECT 1 FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?',
+        [table, column]
+      );
+      if (found.length === 0) {
+        await conn.query(`ALTER TABLE \`${table}\` ${add}`);
+        console.log(`Added missing column ${table}.${column}`);
+      }
+    }
+
     console.log('Database tables are ready.');
   } finally {
     await conn.end();

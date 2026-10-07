@@ -129,10 +129,12 @@ CREATE TABLE IF NOT EXISTS transactions (
   amount BIGINT NOT NULL,
   is_credit TINYINT(1) NOT NULL,
   transfer_ref VARCHAR(64) NULL,
+  reversed_transfer_ref VARCHAR(64) NULL,
   details JSON NULL,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   KEY idx_tx_account (account_type, account_id, created_at),
-  KEY idx_tx_ref (transfer_ref)
+  KEY idx_tx_ref (transfer_ref),
+  KEY idx_tx_reversed (reversed_transfer_ref)
 ) ENGINE=InnoDB;
 
 CREATE TABLE IF NOT EXISTS savings_goals (
@@ -190,6 +192,20 @@ CREATE TABLE IF NOT EXISTS admin_audit_log (
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   KEY idx_audit_admin (admin_id, created_at),
   KEY idx_audit_target (target_type, target_id)
+) ENGINE=InnoDB;
+
+-- ---------- fingerprint / device login tokens ----------
+CREATE TABLE IF NOT EXISTS device_tokens (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  user_id INT NOT NULL,
+  token_hash CHAR(64) NOT NULL,
+  device_name VARCHAR(100) NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  last_used_at TIMESTAMP NULL,
+  expires_at TIMESTAMP NOT NULL,
+  UNIQUE KEY uniq_device_token (token_hash),
+  KEY idx_device_user (user_id),
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 ) ENGINE=InnoDB;
 
 -- ---------- login lockouts (survive server restarts) ----------
